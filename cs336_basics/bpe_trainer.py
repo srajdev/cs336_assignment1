@@ -1,25 +1,14 @@
-# I need to create a BPE tokenizer that can tokenize a string into a list of tokens.
-# <|endoftext|> is the special token for the end of the text.
-# take the file, create chuncks.
-# for each chunck run the regres that splits out the works along with white space
-# create a tuple of tyhese usb tokenizert with their count
-# then count the conscutive pairs in tuple and create a count of all the pairs
-# find the hightest pair and merge it and create a new encoding
-# keep doing till the vocab size is met, or do we go with # of merges??
-# we have 256 + 1 (endoftext) tokens to start with
-# return a list of all the tokens and their bytes
-# a list of all the merges?
-
-
-#from pretokenization_example import find_chunk_boundaries
-
 import os
 import regex as re
 import time
 import functools
+import pickle
+import gzip
+import json
 from typing import List, Dict, Tuple, Optional, BinaryIO
 from collections import Counter
 from multiprocessing import Pool
+import hashlib
 
 
 def find_chunk_boundaries(
@@ -78,105 +67,200 @@ def time_function(func):
         start_time = time.perf_counter()
         result = func(*args, **kwargs)
         end_time = time.perf_counter()
-        if func.__name__ in ["train_bpe"]:
-            execution_time = end_time - start_time
-            print(f"{func.__name__} took {execution_time:.6f} seconds to execute")
+        execution_time = end_time - start_time
+        print(f"{func.__name__} took {execution_time:.2f} seconds")
         return result
     return wrapper
 
+
+# NEW: Worker function for multiprocessing (must be at module level)
+def count_chunk_worker(chunk_data: str, special_tokens: List[str]) -> Dict[Tuple[bytes, ...], int]:
+    """Worker function for counting tokens in a chunk - can be pickled."""
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    
+    # Split the content into documents
+    documents = [chunk_data]
+    for special_token in special_tokens:
+        new_documents = []
+        for doc in documents:
+            new_documents.extend(doc.split(special_token))
+        documents = new_documents
+
+    counts: Dict[Tuple[bytes, ...], int] = {}
+    for d in documents:
+        for match in re.finditer(PAT, d):
+            token = match.group()
+            token_tuple = tuple(bytes([b]) for b in token.encode("utf-8"))
+            counts[token_tuple] = counts.get(token_tuple, 0) + 1
+    return counts
+
+
 class BPETokenizer:
-    @time_function
-    def __init__(self, input_path: str, vocab_size: int, special_tokens: List[str]) -> None:
+    def __init__(self, input_path: str, vocab_size: int, special_tokens: List[str], 
+                 checkpoint_dir: str = "checkpoints", checkpoint_every: int = 100) -> None:
         """
-        Initialize the BPETokenizer.
-
-        Args:
-            input_path (str): Path to the input text file.
-            vocab_size (int): Desired vocabulary size for the tokenizer.
-            special_tokens (List[str]): List of special tokens to use (e.g., end of text, padding, etc.).
+        Initialize the BPETokenizer with checkpointing support.
         """
-        self.input_path: str = input_path
-        self.vocab_size: int = vocab_size
-        self.special_tokens: List[str] = special_tokens
+        self.input_path = input_path
+        self.vocab_size = vocab_size
+        self.special_tokens = special_tokens
         self.vocab: Dict[int, bytes] = {}
-        self.latest_vocab_index: int = 0
+        self.latest_vocab_index = 0
         self.merges: List[Tuple[bytes, bytes]] = []
-        # Add persistent pair counts for optimization
         self.pair_counts: Dict[Tuple[bytes, bytes], int] = {}
-        # NEW: Track which tokens contain each pair for faster updates
         self.pair_to_tokens: Dict[Tuple[bytes, bytes], set[Tuple[bytes, ...]]] = {}
-        #self.load_vocab()
-        #self.load_merges()
+        
+        # NEW: Checkpointing parameters
+        self.checkpoint_dir = checkpoint_dir
+        self.checkpoint_every = checkpoint_every
+        self.current_merge_step = 0
+        
+        # Create checkpoint directory
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Generate file hash for cache validation
+        self.file_hash = self._generate_file_hash()
 
-    @time_function
+    def _generate_file_hash(self) -> str:
+        """Generate hash of input file for cache validation."""
+        hasher = hashlib.md5()
+        with open(self.input_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()[:8]  # Use first 8 chars
+
+    def _get_checkpoint_path(self, step: int) -> str:
+        """Get checkpoint file path for a given step."""
+        base_name = os.path.basename(self.input_path).split('.')[0]
+        return os.path.join(
+            self.checkpoint_dir, 
+            f"bpe_{base_name}_{self.vocab_size}_{self.file_hash}_step_{step}.pkl.gz"
+        )
+
+    def _get_token_counts_cache_path(self) -> str:
+        """Get cache path for initial token counts."""
+        base_name = os.path.basename(self.input_path).split('.')[0]
+        return os.path.join(
+            self.checkpoint_dir,
+            f"token_counts_{base_name}_{self.file_hash}.pkl.gz"
+        )
+
+    def save_checkpoint(self, step: int, token_counts: Dict[Tuple[bytes, ...], int]) -> None:
+        """Save current training state to checkpoint."""
+        checkpoint_data = {
+            'vocab': self.vocab,
+            'latest_vocab_index': self.latest_vocab_index,
+            'merges': self.merges,
+            'pair_counts': self.pair_counts,
+            'pair_to_tokens': self.pair_to_tokens,
+            'token_counts': token_counts,
+            'current_merge_step': step,
+            'vocab_size': self.vocab_size,
+            'special_tokens': self.special_tokens,
+            'file_hash': self.file_hash
+        }
+        
+        checkpoint_path = self._get_checkpoint_path(step)
+        with gzip.open(checkpoint_path, 'wb') as f:
+            pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        print(f"Checkpoint saved at step {step}: {checkpoint_path}")
+
+    def load_checkpoint(self, step: int = None) -> Tuple[Optional[int], Optional[Dict[Tuple[bytes, ...], int]]]:
+        """Load checkpoint from file. If step is None, loads the latest checkpoint."""
+        if step is None:
+            # Find latest checkpoint
+            checkpoint_files = []
+            for f in os.listdir(self.checkpoint_dir):
+                if f.startswith(f"bpe_") and f.endswith(".pkl.gz") and self.file_hash in f:
+                    try:
+                        step_num = int(f.split('_step_')[1].split('.')[0])
+                        checkpoint_files.append((step_num, f))
+                    except (IndexError, ValueError):
+                        continue
+            
+            if not checkpoint_files:
+                return None, None
+            
+            # Get latest checkpoint
+            step, filename = max(checkpoint_files)
+            checkpoint_path = os.path.join(self.checkpoint_dir, filename)
+        else:
+            checkpoint_path = self._get_checkpoint_path(step)
+            if not os.path.exists(checkpoint_path):
+                return None, None
+
+        try:
+            with gzip.open(checkpoint_path, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            
+            # Validate checkpoint compatibility
+            if (checkpoint_data['vocab_size'] != self.vocab_size or 
+                checkpoint_data['special_tokens'] != self.special_tokens or
+                checkpoint_data['file_hash'] != self.file_hash):
+                print("Checkpoint incompatible with current configuration")
+                return None, None
+            
+            # Restore state
+            self.vocab = checkpoint_data['vocab']
+            self.latest_vocab_index = checkpoint_data['latest_vocab_index']
+            self.merges = checkpoint_data['merges']
+            self.pair_counts = checkpoint_data['pair_counts']
+            self.pair_to_tokens = checkpoint_data['pair_to_tokens']
+            self.current_merge_step = checkpoint_data['current_merge_step']
+            
+            print(f"Loaded checkpoint from step {self.current_merge_step}")
+            return self.current_merge_step, checkpoint_data['token_counts']
+            
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            return None, None
+
+    def cache_token_counts(self, token_counts: Dict[Tuple[bytes, ...], int]) -> None:
+        """Cache the initial token counts."""
+        cache_path = self._get_token_counts_cache_path()
+        with gzip.open(cache_path, 'wb') as f:
+            pickle.dump(token_counts, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"Token counts cached: {cache_path}")
+
+    def load_cached_token_counts(self) -> Optional[Dict[Tuple[bytes, ...], int]]:
+        """Load cached token counts if available."""
+        cache_path = self._get_token_counts_cache_path()
+        if os.path.exists(cache_path):
+            try:
+                with gzip.open(cache_path, 'rb') as f:
+                    token_counts = pickle.load(f)
+                print(f"Loaded cached token counts: {cache_path}")
+                return token_counts
+            except Exception as e:
+                print(f"Error loading cached token counts: {e}")
+        return None
+
+    #@time_function
     def load_vocab(self) -> None:
-        """
-        Initialize the vocabulary with all single-byte values and the special tokens.
-        """
+        """Initialize the vocabulary with all single-byte values and the special tokens."""
         self.vocab = {i: bytes([i]) for i in range(256)}
         self.latest_vocab_index = len(self.vocab)
         for special_token in self.special_tokens:
             self.vocab[self.latest_vocab_index] = special_token.encode("utf-8")
             self.latest_vocab_index += 1
 
-    @time_function
-    def load_documents(self, input_path: str) -> List[str]:
-        """
-        Load documents from the input file, splitting them by the first special token.
-
-        Args:
-            input_path (str): Path to the input text file.
-
-        Returns:
-            List[str]: List of documents split by the first special token.
-        """
-        documents = []
-        with open(input_path, 'r') as file:
-            content = file.read()
-            documents = [content]
-            for special_token in self.special_tokens:
-                new_documents = []
-                for doc in documents:
-                    new_documents.extend(doc.split(special_token))
-                documents = new_documents
-        return documents
-
-    @time_function
-    def _count_chunk(self, content: str) -> Dict[Tuple[bytes, ...], int]:
-        # Split the content into documents
-        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""                        
-        documents = [content]
-        for special_token in self.special_tokens:
-            new_documents = []
-            for doc in documents:
-                new_documents.extend(doc.split(special_token))
-            documents = new_documents
-
-        counts: Dict[Tuple[bytes, ...], int] = {}
-        for d in documents:
-            for match in re.finditer(PAT, d):
-                token = match.group()
-                token_tuple = tuple(bytes([b]) for b in token.encode("utf-8"))
-                counts[token_tuple] = counts.get(token_tuple, 0) + 1
-        return counts
-    
-    @time_function
+    #@time_function
     def build_count_list(self, input_path: str, num_processes: Optional[int] = None) -> Dict[Tuple[bytes, ...], int]:
-        """
-        Build a count dictionary of token tuples from the loaded documents.
+        """Build a count dictionary of token tuples from the loaded documents."""
+        # Try to load from cache first
+        cached_counts = self.load_cached_token_counts()
+        if cached_counts is not None:
+            return cached_counts
 
-        Args:
-            input_path (str): Path to the input text file (not used, relies on self.documents).
-            num_processes (Optional[int]): Number of processes to use for parallel processing. If None, uses serial processing.
+        print(f"Building token counts with {num_processes or 1} processes...")
         
-        Returns:
-            Dict[Tuple[bytes, ...], int]: Dictionary mapping token tuples to their frequency count.
-        """
         if not num_processes:
             content = None
             with open(input_path, 'r') as file:
                 content = file.read()
-            counts = self._count_chunk(content)
+            counts = count_chunk_worker(content, self.special_tokens)
+            self.cache_token_counts(counts)
             return counts
         
         with open(input_path, "rb") as f:
@@ -187,63 +271,44 @@ class BPETokenizer:
             for start, end in zip(boundaries[:-1], boundaries[1:]):
                 f.seek(start)
                 chunk = f.read(end - start).decode("utf-8", errors="ignore")
-                chunk_params.append((chunk,))
+                chunk_params.append((chunk, self.special_tokens))
                     
             with Pool(num_processes) as pool:
-                chunk_counts = pool.starmap(self._count_chunk, chunk_params)
+                chunk_counts = pool.starmap(count_chunk_worker, chunk_params)
                 
             # Merge all chunk counts                
-            final_count = result = sum((Counter(d) for d in chunk_counts), Counter())
+            final_count = sum((Counter(d) for d in chunk_counts), Counter())
             final_counts: Dict[Tuple[bytes, ...], int] = dict(final_count)
+            
+            # Cache the results
+            self.cache_token_counts(final_counts)
             return final_counts
 
-    
-    @time_function
+    #@time_function
     def initialize_pair_counts(self, token_counts: Dict[Tuple[bytes, ...], int]) -> None:
-        """
-        Initialize the pair counts dictionary from token counts. This is called once.
-
-        Args:
-            token_counts (Dict[Tuple[bytes, ...], int]): Dictionary of token tuples and their counts.
-        """
+        """Initialize the pair counts dictionary from token counts."""
+        print("Initializing pair counts...")
         self.pair_counts = {}
-        self.pair_to_tokens = {} # Clear previous data
+        self.pair_to_tokens = {}
+        
         for k, v in token_counts.items():
             for i in range(len(k) - 1):
                 pair = (k[i], k[i+1])
                 self.pair_counts[pair] = self.pair_counts.get(pair, 0) + v
-                # Add tokens containing this pair to the set
                 if pair in self.pair_to_tokens:
                     self.pair_to_tokens[pair].add(k)
                 else:
                     self.pair_to_tokens[pair] = {k}
-    
-    @time_function
+
     def find_most_frequent_pair(self) -> Tuple[bytes, bytes]:
-        """
-        Find and return the most frequent pair from the current pair counts.
-        
-        Returns:
-            Tuple[bytes, bytes]: The most frequent pair.
-        """
+        """Find and return the most frequent pair from the current pair counts."""
         if not self.pair_counts:
             raise ValueError("No pairs available to merge")
         
-        # Find the pair with maximum count, using lexicographic order as tiebreaker
         return max(self.pair_counts, key=lambda k: (self.pair_counts[k], k))
-    
-    #@time_function
+
     def merge_tuple_with_match(self, token_tuple: Tuple[bytes, ...], best_tuple: Tuple[bytes, bytes]) -> Tuple[bytes, ...]:
-        """
-        Merge consecutive bytes in a token tuple that match the given best pair.
-
-        Args:
-            token_tuple (Tuple[bytes, ...]): The tuple of bytes to process.
-            best_tuple (Tuple[bytes, bytes]): The pair of bytes to merge when found.
-
-        Returns:
-            Tuple[bytes, ...]: A new tuple with matching pairs merged into single bytes.
-        """
+        """Merge consecutive bytes in a token tuple that match the given best pair."""
         if len(token_tuple) < 2:
             return token_tuple
         
@@ -260,73 +325,46 @@ class BPETokenizer:
 
         return tuple(result)
 
-    @time_function
+    #@time_function
     def update_pair_counts(self, token_counts: Dict[Tuple[bytes, ...], int], merge_pair: Tuple[bytes, bytes]) -> Dict[Tuple[bytes, ...], int]:
-        """
-        Update pair counts incrementally when performing a merge.
-        
-        Args:
-            token_counts: Current token counts
-            merge_pair: The pair being merged
-            
-        Returns:
-            Updated token counts
-        """
+        """Update pair counts incrementally when performing a merge."""
         updated_counts = {}
-        new_token = merge_pair[0] + merge_pair[1]
         
         # Get all tokens that contain the pair being merged
         tokens_to_update = self.pair_to_tokens.get(merge_pair, set())
         
-        # OPTIMIZATION: Only process tokens that might be affected
         for token_tuple, count in token_counts.items():
             if token_tuple in tokens_to_update:
-                # This token contains the merge pair, so process it
                 old_tuple = token_tuple
                 new_tuple = self.merge_tuple_with_match(token_tuple, merge_pair)
                 updated_counts[new_tuple] = count
                 
-                # Update pair counts since the tuple changed
-                # Remove old pairs from this token
+                # Update pair counts
                 for i in range(len(old_tuple) - 1):
                     old_pair = (old_tuple[i], old_tuple[i+1])
                     self.pair_counts[old_pair] -= count
                     if self.pair_counts[old_pair] <= 0:
                         del self.pair_counts[old_pair]
-                    # Remove tokens containing the old pair
                     if old_pair in self.pair_to_tokens:
                         self.pair_to_tokens[old_pair].discard(old_tuple)
                         if not self.pair_to_tokens[old_pair]:
                             del self.pair_to_tokens[old_pair]
                 
-                # Add new pairs from the updated token
+                # Add new pairs
                 for i in range(len(new_tuple) - 1):
                     new_pair = (new_tuple[i], new_tuple[i+1])
                     self.pair_counts[new_pair] = self.pair_counts.get(new_pair, 0) + count
-                    # Add tokens containing the new pair
                     if new_pair in self.pair_to_tokens:
                         self.pair_to_tokens[new_pair].add(new_tuple)
                     else:
                         self.pair_to_tokens[new_pair] = {new_tuple}
             else:
-                # Token is unchanged, just copy it over
                 updated_counts[token_tuple] = count
         
         return updated_counts
 
-    @time_function
     def perform_merge(self, token_counts: Dict[Tuple[bytes, ...], int], merge_pair: Tuple[bytes, bytes]) -> Dict[Tuple[bytes, ...], int]:
-        """
-        Perform a merge operation and update all data structures.
-        
-        Args:
-            token_counts: Current token counts
-            merge_pair: The pair to merge
-            
-        Returns:
-            Updated token counts
-        """
-        # Update token counts and pair counts incrementally
+        """Perform a merge operation and update all data structures."""
         updated_counts = self.update_pair_counts(token_counts, merge_pair)
         
         # Add new token to vocabulary
@@ -336,75 +374,95 @@ class BPETokenizer:
         
         return updated_counts
 
-    @time_function
-    def build_tokens(self, num_processes: Optional[int] = None):
-        self.load_vocab()
+    def save_final_results(self, output_dir: str = "output") -> None:
+        """Save final vocabulary and merges to files."""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        base_name = os.path.basename(self.input_path).split('.')[0]
+        
+        # Save as pickle (most efficient)
+        with gzip.open(os.path.join(output_dir, f"{base_name}_vocab_{self.vocab_size}.pkl.gz"), 'wb') as f:
+            pickle.dump({'vocab': self.vocab, 'merges': self.merges}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        # Also save as JSON for inspection
+        with open(os.path.join(output_dir, f"{base_name}_vocab_{self.vocab_size}.json"), 'w') as f:
+            json_data = {
+                'vocab': {str(k): list(v) for k, v in self.vocab.items()},
+                'merges': [[list(m[0]), list(m[1])] for m in self.merges],
+                'vocab_size': self.vocab_size,
+                'special_tokens': self.special_tokens
+            }
+            json.dump(json_data, f, indent=2)
+        
+        print(f"Results saved to {output_dir}")
+
+    #@time_function
+    def build_tokens(self, num_processes: Optional[int] = None, resume: bool = True):
+        """Build tokens with checkpointing support."""
+        # Try to resume from checkpoint
+        if resume:
+            step, token_counts = self.load_checkpoint()
+            if step is not None and token_counts is not None:
+                print(f"Resuming from step {step}")
+                start_step = step + 1
+            else:
+                print("No compatible checkpoint found, starting fresh")
+                self.load_vocab()
+                token_counts = self.build_count_list(self.input_path, num_processes)
+                self.initialize_pair_counts(token_counts)
+                start_step = 0
+        else:
+            print("Starting fresh (ignoring checkpoints)")
+            self.load_vocab()
+            token_counts = self.build_count_list(self.input_path, num_processes)
+            self.initialize_pair_counts(token_counts)
+            start_step = 0
+
         num_merges = self.vocab_size - len(self.vocab)
-        token_counts = self.build_count_list(self.input_path, num_processes)
+        print(f"Need to perform {num_merges - start_step} more merges")
         
-        # Initialize pair counts once
-        self.initialize_pair_counts(token_counts)
-        
-        for i in range(num_merges):
-            if not self.pair_counts:  # No more pairs to merge
+        for i in range(start_step, num_merges):
+            if not self.pair_counts:
+                print("No more pairs to merge")
                 break
                 
-            # Find most frequent pair (now O(1) lookup instead of O(n) recalculation)
             merge_pair = self.find_most_frequent_pair()
-            
-            # Perform merge and update counts incrementally
             token_counts = self.perform_merge(token_counts, merge_pair)
+            self.current_merge_step = i
+            
+            # Progress tracking
+            if i % 10 == 0:
+                print(f"Merge {i}/{num_merges}: {merge_pair[0]} + {merge_pair[1]} "
+                      f"(count: {self.pair_counts.get(merge_pair, 0)})")
+            
+            # Checkpointing
+            if i % self.checkpoint_every == 0:
+                self.save_checkpoint(i, token_counts)
+        
+        # Final checkpoint
+        self.save_checkpoint(self.current_merge_step, token_counts)
+        self.save_final_results()
+
 
 @time_function
-def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], num_processes: Optional[int] = None) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
-    tokenizer = BPETokenizer(input_path, vocab_size, special_tokens)
-    tokenizer.build_tokens(num_processes=num_processes)
-    return (tokenizer.vocab, tokenizer.merges)  
+def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str], 
+              num_processes: Optional[int] = None, resume: bool = True,
+              checkpoint_every: int = 100) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+    """Train BPE with checkpointing support."""
+    tokenizer = BPETokenizer(input_path, vocab_size, special_tokens, 
+                           checkpoint_every=checkpoint_every)
+    tokenizer.build_tokens(num_processes=num_processes, resume=resume)
+    return (tokenizer.vocab, tokenizer.merges)
+
 
 if __name__ == "__main__":
-    import cProfile
-    # Initialize the BPE tokenizer
-    #input_path = "/Users/hap-106/dev/cs336/assignment1-basics/tests/fixtures/corpus.en"
-    PROJECT_ROOT = "/workspace" #"/Users/hap-106/dev"
-    file_name = "TinyStoriesV2-GPT4-train.txt"
-    input_path =  PROJECT_ROOT + '/cs336/assignment1-basics/data/' + file_name
-    vocab_size = 10000
+    PROJECT_ROOT = "/workspace"
+    file_name = "TinyStoriesV2-GPT4-valid.txt" #"TinyStoriesV2-GPT4-train.txt"
+    input_path = PROJECT_ROOT + '/cs336_assignment1/data/' + file_name
+    vocab_size = 500
     special_token = "<|endoftext|>"
 
-    #cProfile.run("train_bpe(input_path, vocab_size, [special_token], 32)")
-    vocab, merges = train_bpe(input_path, vocab_size, [special_token], num_processes=32)
-
-    ## Save vocab and merges to files
-    #import json
-
-    ## Save vocab as JSON, using string keys since JSON doesn't support int keys
-    #with open('vocab.json', 'w') as f:
-    #    # Convert bytes to list of ints for JSON serialization
-    #    json_vocab = {str(k): list(v) for k,v in vocab.items()}
-    #    json.dump(json_vocab, f)
-
-    ## Save merges as JSON list of int lists
-    #with open('merges.json', 'w') as f:
-    #    # Convert bytes tuples to lists of ints
-    #    json_merges = [list(m[0]) + list(m[1]) for m in merges]
-    #    json.dump(json_merges, f)
-    
-    #tokenizer = BPETokenizer(input_path, vocab_size, [special_token])
-    
-    # Build the tokens
-    #tokenizer.build_tokens()
-    
-    # Print results
-    #print("\nVocabulary:")
-    #print(len(tokenizer.vocab))
-    
-    #print("\nMerges:")
-    #for i in range(len(tokenizer.merges)):
-    #    print(f"{i}: {tokenizer.merges[i]}")
-    
-    #print("\nLast 30 vocabulary items:")
-    #vocab_items = list(tokenizer.vocab.items())
-    #for idx, item in vocab_items[-30:]:
-    #    print(f"{idx}: {item}")
-
-
+    vocab, merges = train_bpe(
+        input_path, vocab_size, [special_token], 
+        num_processes=16, resume=True, checkpoint_every=50
+    )
