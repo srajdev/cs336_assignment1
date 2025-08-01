@@ -68,7 +68,7 @@ def time_function(func):
         result = func(*args, **kwargs)
         end_time = time.perf_counter()
         execution_time = end_time - start_time
-        print(f"{func.__name__} took {execution_time:.2f} seconds")
+        #print(f"{func.__name__} took {execution_time:.2f} seconds")
         return result
     return wrapper
 
@@ -236,7 +236,7 @@ class BPETokenizer:
                 print(f"Error loading cached token counts: {e}")
         return None
 
-    #@time_function
+    @time_function
     def load_vocab(self) -> None:
         """Initialize the vocabulary with all single-byte values and the special tokens."""
         self.vocab = {i: bytes([i]) for i in range(256)}
@@ -245,7 +245,7 @@ class BPETokenizer:
             self.vocab[self.latest_vocab_index] = special_token.encode("utf-8")
             self.latest_vocab_index += 1
 
-    #@time_function
+    @time_function
     def build_count_list(self, input_path: str, num_processes: Optional[int] = None) -> Dict[Tuple[bytes, ...], int]:
         """Build a count dictionary of token tuples from the loaded documents."""
         # Try to load from cache first
@@ -284,7 +284,7 @@ class BPETokenizer:
             self.cache_token_counts(final_counts)
             return final_counts
 
-    #@time_function
+    @time_function
     def initialize_pair_counts(self, token_counts: Dict[Tuple[bytes, ...], int]) -> None:
         """Initialize the pair counts dictionary from token counts."""
         print("Initializing pair counts...")
@@ -307,6 +307,7 @@ class BPETokenizer:
         
         return max(self.pair_counts, key=lambda k: (self.pair_counts[k], k))
 
+    @time_function
     def merge_tuple_with_match(self, token_tuple: Tuple[bytes, ...], best_tuple: Tuple[bytes, bytes]) -> Tuple[bytes, ...]:
         """Merge consecutive bytes in a token tuple that match the given best pair."""
         if len(token_tuple) < 2:
@@ -325,16 +326,29 @@ class BPETokenizer:
 
         return tuple(result)
 
-    #@time_function
+    @time_function
     def update_pair_counts(self, token_counts: Dict[Tuple[bytes, ...], int], merge_pair: Tuple[bytes, bytes]) -> Dict[Tuple[bytes, ...], int]:
-        """Update pair counts incrementally when performing a merge."""
-        updated_counts = {}
+        """Start with copy, then modify only what's needed."""
+        start_time = time.perf_counter()
         
-        # Get all tokens that contain the pair being merged
-        tokens_to_update = self.pair_to_tokens.get(merge_pair, set())
+        # FAST: Copy the entire dictionary at once
+        copy_start = time.perf_counter()
+        updated_counts = token_counts.copy()  # O(n) but very fast in C
+        copy_time = time.perf_counter() - copy_start
         
-        for token_tuple, count in token_counts.items():
-            if token_tuple in tokens_to_update:
+        # FIX: Make a copy of the set to avoid "set changed size during iteration"
+        tokens_to_update = self.pair_to_tokens.get(merge_pair, set()).copy()
+        
+        # FAST: Only process the small subset that needs changes
+        update_start = time.perf_counter()
+        for token_tuple in tokens_to_update:
+            if token_tuple in updated_counts:  # Make sure it still exists
+                count = updated_counts[token_tuple]
+                
+                # Remove old token
+                del updated_counts[token_tuple]
+                
+                # Add updated token
                 old_tuple = token_tuple
                 new_tuple = self.merge_tuple_with_match(token_tuple, merge_pair)
                 updated_counts[new_tuple] = count
@@ -358,11 +372,55 @@ class BPETokenizer:
                         self.pair_to_tokens[new_pair].add(new_tuple)
                     else:
                         self.pair_to_tokens[new_pair] = {new_tuple}
-            else:
-                updated_counts[token_tuple] = count
+        
+        update_time = time.perf_counter() - update_start
+        total_time = time.perf_counter() - start_time
+        
+        #if total_time > 0.5:
+        #    print(f"Copy method: {total_time:.3f}s (copy: {copy_time:.3f}s, update: {update_time:.3f}s)")
+        #    print(f"Tokens updated: {len(tokens_to_update):,}/{len(token_counts):,} ({len(tokens_to_update)/len(token_counts)*100:.2f}%)")
         
         return updated_counts
+    
 
+#    def update_pair_counts(self, token_counts: Dict[Tuple[bytes, ...], int], merge_pair: Tuple[bytes, bytes]) -> Dict[Tuple[bytes, ...], int]:
+#        """Update pair counts incrementally when performing a merge."""
+#        updated_counts = {}
+#        
+#        # Get all tokens that contain the pair being merged
+#        tokens_to_update = self.pair_to_tokens.get(merge_pair, set())
+#        
+#        for token_tuple, count in token_counts.items():
+#            if token_tuple in tokens_to_update:
+#                old_tuple = token_tuple
+#                new_tuple = self.merge_tuple_with_match(token_tuple, merge_pair)
+#                updated_counts[new_tuple] = count
+#                
+#                # Update pair counts
+#                for i in range(len(old_tuple) - 1):
+#                    old_pair = (old_tuple[i], old_tuple[i+1])
+#                    self.pair_counts[old_pair] -= count
+#                    if self.pair_counts[old_pair] <= 0:
+#                        del self.pair_counts[old_pair]
+#                    if old_pair in self.pair_to_tokens:
+#                        self.pair_to_tokens[old_pair].discard(old_tuple)
+#                        if not self.pair_to_tokens[old_pair]:
+#                            del self.pair_to_tokens[old_pair]
+#                
+#                # Add new pairs
+#                for i in range(len(new_tuple) - 1):
+#                    new_pair = (new_tuple[i], new_tuple[i+1])
+#                    self.pair_counts[new_pair] = self.pair_counts.get(new_pair, 0) + count
+#                    if new_pair in self.pair_to_tokens:
+#                        self.pair_to_tokens[new_pair].add(new_tuple)
+#                    else:
+#                        self.pair_to_tokens[new_pair] = {new_tuple}
+#            else:
+#                updated_counts[token_tuple] = count
+#        
+#        return updated_counts
+    
+    @time_function
     def perform_merge(self, token_counts: Dict[Tuple[bytes, ...], int], merge_pair: Tuple[bytes, bytes]) -> Dict[Tuple[bytes, ...], int]:
         """Perform a merge operation and update all data structures."""
         updated_counts = self.update_pair_counts(token_counts, merge_pair)
@@ -396,7 +454,7 @@ class BPETokenizer:
         
         print(f"Results saved to {output_dir}")
 
-    #@time_function
+    @time_function
     def build_tokens(self, num_processes: Optional[int] = None, resume: bool = True):
         """Build tokens with checkpointing support."""
         # Try to resume from checkpoint
@@ -419,9 +477,11 @@ class BPETokenizer:
             start_step = 0
 
         num_merges = self.vocab_size - len(self.vocab)
-        print(f"Need to perform {num_merges - start_step} more merges")
+        print(f"Need to perform {num_merges} more merges")
+
+        end_step = start_step + num_merges
         
-        for i in range(start_step, num_merges):
+        for i in range(start_step, end_step):
             if not self.pair_counts:
                 print("No more pairs to merge")
                 break
@@ -432,7 +492,7 @@ class BPETokenizer:
             
             # Progress tracking
             if i % 10 == 0:
-                print(f"Merge {i}/{num_merges}: {merge_pair[0]} + {merge_pair[1]} "
+                print(f"Merge {i}/{end_step}: {merge_pair[0]} + {merge_pair[1]} "
                       f"(count: {self.pair_counts.get(merge_pair, 0)})")
             
             # Checkpointing
@@ -457,12 +517,12 @@ def train_bpe(input_path: str, vocab_size: int, special_tokens: list[str],
 
 if __name__ == "__main__":
     PROJECT_ROOT = "/workspace"
-    file_name = "TinyStoriesV2-GPT4-valid.txt" #"TinyStoriesV2-GPT4-train.txt"
+    file_name = "owt_train.txt"#"TinyStoriesV2-GPT4-valid.txt" #"TinyStoriesV2-GPT4-train.txt"
     input_path = PROJECT_ROOT + '/cs336_assignment1/data/' + file_name
-    vocab_size = 500
+    vocab_size = 32000
     special_token = "<|endoftext|>"
 
     vocab, merges = train_bpe(
         input_path, vocab_size, [special_token], 
-        num_processes=16, resume=True, checkpoint_every=50
+        num_processes=4, resume=True, checkpoint_every=1000
     )

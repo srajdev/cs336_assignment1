@@ -2,7 +2,7 @@
 
 # RunPod BPE Tokenizer Setup Script
 # Automated setup for cs336_assignment1 repository
-
+#
 set -e  # Exit on any error
 
 echo "🚀 Starting RunPod BPE Tokenizer Setup..."
@@ -45,14 +45,15 @@ print_status "System dependencies installed successfully"
 print_status "Installing UV package manager..."
 
 curl -LsSf https://astral.sh/uv/install.sh | sh
+
 source ~/.bashrc
 
 print_info "UV version: $(uv --version)"
 
 
-cd ~/workspace/cs336_assignment1
+cd /workspace/cs336_assignment1
 
-print_info "Setting up UV env for CPU"
+#print_info "Setting up UV env for CPU"
 
 uv sync --no-install-package torch --no-install-package torchvision --no-install-package torchaudio
 source .venv/bin/activate
@@ -62,25 +63,25 @@ uv run python -c "import torch; print(f'PyTorch version: {torch.__version__}'); 
 
 print_info "Setup env with CPU" 
 
-print_info "getting project data"
-
-mkdir data
-cd data
-
-wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
-wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt
-
-# Download OpenWebText samples
-wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz
-wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_valid.txt.gz
-
-# Extract the compressed files
-gunzip owt_train.txt.gz
-gunzip owt_valid.txt.gz
-
-cd ..
-
-print_info "Data downloaded"
+#print_info "getting project data"
+#
+#mkdir data
+#cd data
+#
+#wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
+#wget https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt
+#
+## Download OpenWebText samples
+#wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz
+#wget https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_valid.txt.gz
+#
+## Extract the compressed files
+#gunzip owt_train.txt.gz
+#gunzip owt_valid.txt.gz
+#
+#cd ..
+#
+#print_info "Data downloaded"
 
 
 # Verify setup by running tests
